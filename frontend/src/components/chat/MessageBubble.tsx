@@ -81,6 +81,11 @@ export function MessageBubble({ message, onJumpToLine, onViewFile }: MessageBubb
                                 </summary>
                                 <div className="mt-1 flex flex-col gap-1.5 pl-[1.125rem] text-muted-foreground">
                                   <p>{f.description}</p>
+                                  {f.suggested_fix && (
+                                    <pre className="overflow-x-auto rounded bg-muted p-2 text-xs text-foreground">
+                                      <code>{f.suggested_fix}</code>
+                                    </pre>
+                                  )}
                                   {f.line != null && (
                                     <button
                                       type="button"

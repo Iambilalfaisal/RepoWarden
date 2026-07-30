@@ -44,7 +44,12 @@ class AnalyzerInput(BaseModel):
 def _make_analyzer_tool(
     name: str, description: str, system_prompt: str, root: Path, llm: BaseChatModel
 ) -> StructuredTool:
-    structured_llm = llm.with_structured_output(AnalysisReport)
+    # function_calling routes structured output through the same tool-calling
+    # path every model here already has to support to use this agent at all —
+    # broader OpenRouter-model compatibility than the default json_schema
+    # mode, which several providers don't implement faithfully (some just
+    # return prose instead of the requested schema).
+    structured_llm = llm.with_structured_output(AnalysisReport, method="function_calling")
 
     async def _run(path: str, focus: str = "") -> str:
         try:
@@ -57,7 +62,10 @@ def _make_analyzer_tool(
         prompt = (
             f"File: {path}\n\n```\n{code}\n```\n\n"
             + (f"Focus area: {focus}\n\n" if focus else "")
-            + "Produce an AnalysisReport for this file."
+            + "Produce an AnalysisReport for this file. Where a finding has a "
+            "clear, concrete fix, include it as a short code snippet in "
+            "suggested_fix — leave it null if the fix genuinely needs more "
+            "context or a design decision first."
         )
         result = await structured_llm.ainvoke(
             [
@@ -65,6 +73,16 @@ def _make_analyzer_tool(
                 {"role": "user", "content": prompt},
             ]
         )
+        if result is None:
+            # The model responded without actually calling the structured
+            # output function — happens occasionally even in function_calling
+            # mode with smaller models. Fail this one analysis gracefully
+            # rather than crashing the whole agent turn.
+            return AnalysisReport(
+                file_name=path,
+                summary="The model did not return a valid analysis for this file — try again.",
+                findings=[],
+            ).model_dump_json()
         result.file_name = path
         return result.model_dump_json()
 

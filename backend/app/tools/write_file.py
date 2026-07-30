@@ -32,7 +32,8 @@ def make_write_file_tool(root: Path, llm: BaseChatModel) -> StructuredTool:
     content and immediately persists it to disk; there's no separate
     propose/apply step."""
 
-    structured_llm = llm.with_structured_output(FileEdit)
+    # See app/tools/analyzers.py for why function_calling — same reasoning.
+    structured_llm = llm.with_structured_output(FileEdit, method="function_calling")
 
     async def _run(path: str, instructions: str) -> str:
         try:
@@ -57,6 +58,17 @@ def make_write_file_tool(root: Path, llm: BaseChatModel) -> StructuredTool:
                 {"role": "user", "content": prompt},
             ]
         )
+        if result is None:
+            # The model responded without calling the structured output
+            # function. Nothing was generated, so nothing gets written —
+            # fail this edit gracefully instead of crashing the agent turn
+            # or writing garbage to disk.
+            return FileEdit(
+                file_name=path,
+                explanation="The model did not return a valid edit for this file — try again.",
+                original_code=original_code,
+                proposed_code=original_code,
+            ).model_dump_json()
         result.file_name = path
         result.original_code = original_code
 

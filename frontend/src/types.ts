@@ -12,6 +12,7 @@ export interface Finding {
   line: number | null
   title: string
   description: string
+  suggested_fix: string | null
 }
 
 export type AnalyzerTool = "security_analyzer" | "performance_analyzer" | "code_quality_analyzer"

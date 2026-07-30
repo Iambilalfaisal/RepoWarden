@@ -1,4 +1,5 @@
 import fnmatch
+import re
 from pathlib import Path
 
 IGNORED_DIR_NAMES = {
@@ -23,6 +24,9 @@ MAX_LIST_ENTRIES = 500
 MAX_TREE_NODES = 2000
 MAX_READ_CHARS_FOR_LLM = 40_000
 MAX_READ_BYTES_FOR_DISPLAY = 5_000_000
+MAX_SEARCH_MATCHES = 50
+MAX_SEARCH_FILES_SCANNED = 2000
+MAX_SEARCH_LINE_LENGTH = 300
 
 
 class FsSafetyError(Exception):
@@ -136,6 +140,63 @@ def read_text_file(root: Path, rel_path: str, max_chars: int | None = None) -> s
     if max_chars is not None and len(content) > max_chars:
         content = content[:max_chars] + f"\n... [truncated, {len(content) - max_chars} more characters]"
     return content
+
+
+def search_files(
+    root: Path,
+    pattern: str,
+    is_regex: bool = False,
+    max_matches: int = MAX_SEARCH_MATCHES,
+) -> list[dict[str, str | int]]:
+    """Text search across every non-ignored, non-secret, non-binary file
+    under root — the "who else calls this?" / blast-radius lookup. Reuses
+    the same traversal and safety rules as list_dir_shallow/build_tree, so
+    nothing this refuses to show in a listing is searchable either."""
+    if is_regex:
+        try:
+            compiled = re.compile(pattern, re.IGNORECASE)
+        except re.error as exc:
+            raise FsSafetyError(f"Invalid regex: {exc}") from exc
+        matches_line = compiled.search
+    else:
+        needle = pattern.lower()
+        matches_line = lambda line: needle in line.lower()  # noqa: E731
+
+    matches: list[dict[str, str | int]] = []
+    files_scanned = 0
+
+    def walk(dir_path: Path) -> None:
+        nonlocal files_scanned
+        try:
+            children = _visible_children(dir_path)
+        except PermissionError:
+            return
+        for child in children:
+            if len(matches) >= max_matches or files_scanned >= MAX_SEARCH_FILES_SCANNED:
+                return
+            if child.is_dir():
+                walk(child)
+                continue
+            if is_binary_by_extension(child.name):
+                continue
+            files_scanned += 1
+            if is_probably_binary(child):
+                continue
+            try:
+                text = child.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            rel = child.relative_to(root).as_posix()
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                if matches_line(line):
+                    matches.append(
+                        {"file": rel, "line": lineno, "text": line.strip()[:MAX_SEARCH_LINE_LENGTH]}
+                    )
+                    if len(matches) >= max_matches:
+                        return
+
+    walk(root)
+    return matches
 
 
 def write_text_file(root: Path, rel_path: str, content: str) -> None:

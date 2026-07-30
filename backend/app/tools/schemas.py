@@ -24,6 +24,7 @@ class Finding(BaseModel):
     line: int | None = None
     title: str
     description: str
+    suggested_fix: str | None = None
 
 
 class AnalysisReport(BaseModel):
