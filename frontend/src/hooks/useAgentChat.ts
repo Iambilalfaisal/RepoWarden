@@ -19,6 +19,7 @@ export function useAgentChat({ rootDir, onFileWritten }: UseAgentChatOptions) {
   const [isStreaming, setIsStreaming] = useState(false)
   const [awaitingAuthorization, setAwaitingAuthorization] = useState(false)
   const [writtenFiles, setWrittenFiles] = useState<Record<string, FileEdit>>({})
+  const [proposedEdits, setProposedEdits] = useState<Record<string, FileEdit>>({})
   const abortRef = useRef<AbortController | null>(null)
   const onFileWrittenRef = useRef(onFileWritten)
   onFileWrittenRef.current = onFileWritten
@@ -30,6 +31,7 @@ export function useAgentChat({ rootDir, onFileWritten }: UseAgentChatOptions) {
   useEffect(() => {
     setMessages([])
     setWrittenFiles({})
+    setProposedEdits({})
     setAwaitingAuthorization(false)
     if (!rootDir) {
       setThreadId(null)
@@ -67,13 +69,14 @@ export function useAgentChat({ rootDir, onFileWritten }: UseAgentChatOptions) {
 
       setMessages((prev) => [
         ...prev,
-        { id: assistantId, role: "assistant", content: "", streaming: true },
+        { id: assistantId, role: "assistant", content: "", streaming: true, startedAt: Date.now() },
       ])
       setIsStreaming(true)
       setAwaitingAuthorization(false)
 
       const toolCalls: ToolCallStatus[] = []
       const analyses: AnalysisResult[] = []
+      const proposals: FileEdit[] = []
       const edits: FileEdit[] = []
 
       const markToolDone = (tool: string) => {
@@ -123,6 +126,23 @@ export function useAgentChat({ rootDir, onFileWritten }: UseAgentChatOptions) {
                   ...m,
                   toolCalls: [...toolCalls],
                   analyses: [...analyses],
+                }))
+                break
+              }
+              case "edit_proposed": {
+                markToolDone("propose_edit")
+                const proposal: FileEdit = {
+                  file_name: payload.file_name,
+                  explanation: payload.explanation,
+                  original_code: payload.original_code,
+                  proposed_code: payload.proposed_code,
+                }
+                proposals.push(proposal)
+                setProposedEdits((prev) => ({ ...prev, [proposal.file_name]: proposal }))
+                updateMessage(assistantId, (m) => ({
+                  ...m,
+                  toolCalls: [...toolCalls],
+                  proposals: [...proposals],
                 }))
                 break
               }
@@ -232,6 +252,7 @@ export function useAgentChat({ rootDir, onFileWritten }: UseAgentChatOptions) {
     isStreaming,
     awaitingAuthorization,
     writtenFiles,
+    proposedEdits,
     sendMessage,
     authorize,
     reject,
