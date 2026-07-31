@@ -28,6 +28,16 @@ MAX_SEARCH_MATCHES = 50
 MAX_SEARCH_FILES_SCANNED = 2000
 MAX_SEARCH_LINE_LENGTH = 300
 
+# Shared wording for every tool's `path` field. Smaller/local models
+# sometimes hallucinate a leading slash or a "/workspace/" prefix (a
+# Docker-coding-agent convention from their training data) even though
+# these tools only ever take plain relative paths — spelling that out with
+# a concrete example measurably reduces how often that happens.
+PATH_FIELD_DESCRIPTION = (
+    "Path relative to the workspace root — e.g. 'app.py' or 'src/main.py'. "
+    "No leading slash, no drive letter, no '/workspace' prefix."
+)
+
 
 class FsSafetyError(Exception):
     """Raised when a filesystem operation would escape the sandboxed root,
@@ -57,7 +67,15 @@ def resolve_root(root_dir: str) -> Path:
 
 
 def resolve_safe_path(root: Path, rel_path: str) -> Path:
-    candidate = (root / rel_path).resolve()
+    # Smaller/local models sometimes hallucinate a leading slash (picked up
+    # from Docker-style "/workspace/foo.py" conventions common in training
+    # data for coding agents) even though our tools only ever describe
+    # relative paths. A leading slash would otherwise resolve as
+    # drive-relative on Windows and trip the escapes-root check below —
+    # normalize it away so that produces a plain "not found", not a scary
+    # security error, for what's actually just a harmless model habit.
+    normalized = rel_path.lstrip("/\\")
+    candidate = (root / normalized).resolve()
     try:
         candidate.relative_to(root)
     except ValueError as exc:

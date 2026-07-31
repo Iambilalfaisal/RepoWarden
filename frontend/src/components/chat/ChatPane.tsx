@@ -43,7 +43,7 @@ export function ChatPane({
   }, [messages])
 
   return (
-    <div className="flex h-full min-w-0 flex-col border-r">
+    <div className="flex h-full min-h-0 min-w-0 flex-col border-r">
       <div className="border-b px-4 py-3">
         <h1 className="text-sm font-semibold">RepoWarden</h1>
         <p className="text-xs text-muted-foreground">Code Evaluation Assistant</p>

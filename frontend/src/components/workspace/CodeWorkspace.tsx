@@ -15,6 +15,7 @@ import {
 import type { editor as MonacoEditorNS } from "monaco-editor"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { cn } from "@/lib/utils"
 import type { FileEdit, TreeNode } from "@/types"
 import { FileTree } from "./FileTree"
 
@@ -29,6 +30,7 @@ interface CodeWorkspaceProps {
   fileContent: string | null
   isFileLoading: boolean
   writtenFiles: Record<string, FileEdit>
+  proposedEdits: Record<string, FileEdit>
 }
 
 function languageForFile(name: string): string {
@@ -56,13 +58,18 @@ function countLineChanges(changes: MonacoEditorNS.ILineChange[]) {
 
 export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, CodeWorkspaceProps>(
   function CodeWorkspace(
-    { tree, activeFile, onSelectFile, fileContent, isFileLoading, writtenFiles },
+    { tree, activeFile, onSelectFile, fileContent, isFileLoading, writtenFiles, proposedEdits },
     ref,
   ) {
     const [showDiff, setShowDiff] = useState(true)
     const [diffStats, setDiffStats] = useState<{ added: number; removed: number } | null>(null)
 
-    const edit = activeFile ? writtenFiles[activeFile] : undefined
+    // A file that's actually been written supersedes any earlier preview
+    // for the same file — the written version is ground truth.
+    const written = activeFile ? writtenFiles[activeFile] : undefined
+    const proposal = activeFile ? proposedEdits[activeFile] : undefined
+    const edit = written ?? proposal
+    const isPreview = !written && Boolean(proposal)
     const language = languageForFile(activeFile ?? "")
     const displayDiff = Boolean(edit) && showDiff
 
@@ -121,12 +128,19 @@ export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, CodeWorkspaceProps>
     }
 
     return (
-      <div className="flex h-full min-w-0 flex-1">
+      <div className="flex h-full min-h-0 min-w-0 flex-1">
         <FileTree tree={tree} activeFile={activeFile} onSelect={onSelectFile} />
-        <div className="flex min-w-0 flex-1 flex-col">
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
           <div className="flex items-center justify-between border-b px-3 py-2">
-            <span className="truncate text-sm font-medium">
-              {activeFile ?? "No file selected"}
+            <span className="flex min-w-0 items-center gap-2">
+              <span className="truncate text-sm font-medium">
+                {activeFile ?? "No file selected"}
+              </span>
+              {isPreview && (
+                <Badge variant="outline" className="shrink-0 border-amber-500 text-amber-600">
+                  Preview — not yet applied
+                </Badge>
+              )}
             </span>
             {edit && (
               <div className="flex items-center gap-2">
@@ -158,7 +172,12 @@ export const CodeWorkspace = forwardRef<CodeWorkspaceHandle, CodeWorkspaceProps>
             )}
           </div>
           {displayDiff && edit?.explanation && (
-            <p className="border-b bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+            <p
+              className={cn(
+                "border-b px-3 py-2 text-xs text-muted-foreground",
+                isPreview ? "bg-amber-50 dark:bg-amber-950/30" : "bg-muted/30",
+              )}
+            >
               {edit.explanation}
             </p>
           )}

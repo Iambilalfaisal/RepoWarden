@@ -15,6 +15,7 @@ function App() {
     isStreaming,
     awaitingAuthorization,
     writtenFiles,
+    proposedEdits,
     sendMessage,
     authorize,
     reject,
@@ -43,7 +44,7 @@ function App() {
   }
 
   return (
-    <div className="grid h-screen grid-cols-[minmax(360px,1fr)_2fr]">
+    <div className="grid h-screen grid-cols-[minmax(360px,1fr)_2fr] overflow-hidden">
       <ChatPane
         messages={messages}
         isHydrating={isHydrating}
@@ -63,6 +64,7 @@ function App() {
         fileContent={workspace.fileContent}
         isFileLoading={workspace.isFileLoading}
         writtenFiles={writtenFiles}
+        proposedEdits={proposedEdits}
       />
     </div>
   )

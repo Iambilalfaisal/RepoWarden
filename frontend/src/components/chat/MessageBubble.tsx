@@ -5,8 +5,9 @@ import { SEVERITY_CONFIG } from "@/lib/severity"
 import { TOOL_META } from "@/lib/tools"
 import type { ChatMessage } from "@/types"
 import { FindingsSummary } from "./FindingsSummary"
+import { StreamingStatus } from "./StreamingStatus"
 import { ToolBadge } from "./ToolBadge"
-import { CheckCircle2, ChevronRight, MapPin } from "lucide-react"
+import { CheckCircle2, ChevronRight, FileDiff, MapPin } from "lucide-react"
 
 interface MessageBubbleProps {
   message: ChatMessage
@@ -33,6 +34,14 @@ export function MessageBubble({ message, onJumpToLine, onViewFile }: MessageBubb
         <AvatarFallback>{isUser ? "You" : "RW"}</AvatarFallback>
       </Avatar>
       <div className={cn("flex min-w-0 max-w-[85%] flex-col gap-2", isUser && "items-end")}>
+        {message.streaming && (
+          <StreamingStatus
+            toolCalls={message.toolCalls}
+            hasContent={Boolean(message.content)}
+            startedAt={message.startedAt ?? Date.now()}
+          />
+        )}
+
         {message.toolCalls && message.toolCalls.length > 0 && (
           <div className="flex flex-wrap gap-1.5">
             {message.toolCalls.map((tc, i) => (
@@ -107,6 +116,32 @@ export function MessageBubble({ message, onJumpToLine, onViewFile }: MessageBubb
                 )
               })}
             </div>
+          </div>
+        )}
+
+        {message.proposals && message.proposals.length > 0 && (
+          <div className="flex w-full flex-col gap-1.5 rounded-md border bg-card p-3 text-sm">
+            <p className="text-xs font-medium text-muted-foreground">
+              {message.proposals.length} proposed change
+              {message.proposals.length === 1 ? "" : "s"} — preview only, nothing written yet
+            </p>
+            {message.proposals.map((edit, i) => (
+              <button
+                key={i}
+                type="button"
+                onClick={() => onViewFile?.(edit.file_name)}
+                className="flex items-start gap-1.5 rounded border-l-2 border-l-amber-500 pl-2.5 text-left hover:bg-accent"
+              >
+                <FileDiff className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600" />
+                <span>
+                  <span className="font-medium underline decoration-dotted underline-offset-2">
+                    {edit.file_name}
+                  </span>
+                  <br />
+                  <span className="text-xs text-muted-foreground">{edit.explanation}</span>
+                </span>
+              </button>
+            ))}
           </div>
         )}
 

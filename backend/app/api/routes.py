@@ -6,15 +6,16 @@ from fastapi import APIRouter, HTTPException, Query
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from sse_starlette.sse import EventSourceResponse
 
-from app.agent.orchestrator import AUTHORIZATION_NOTICE, build_editor_agent, build_reviewer_agent
+from app.agents import AUTHORIZATION_NOTICE, build_editor_agent, build_reviewer_agent
+from app.api.schemas import ChatRequest, ChatTurn
 from app.core.fs_safety import FsSafetyError, build_tree, read_text_file, resolve_root
-from app.tools.schemas import ChatRequest, ChatTurn
 
 router = APIRouter()
 
 # Tools whose output should be surfaced to the UI as structured analysis
 # results rather than a generic tool badge.
 ANALYSIS_TOOLS = {"security_analyzer", "performance_analyzer", "code_quality_analyzer"}
+PROPOSE_TOOL = "propose_edit"
 WRITE_TOOL = "write_file"
 
 
@@ -85,6 +86,8 @@ async def chat(request: ChatRequest) -> EventSourceResponse:
                     payload = _tool_output_to_dict(data.get("output"))
                     if name in ANALYSIS_TOOLS:
                         yield _sse("analysis_result", {"tool": name, **payload})
+                    elif name == PROPOSE_TOOL:
+                        yield _sse("edit_proposed", payload)
                     elif name == WRITE_TOOL:
                         file_written = True
                         yield _sse("file_written", payload)
@@ -92,8 +95,9 @@ async def chat(request: ChatRequest) -> EventSourceResponse:
                         yield _sse("tool_end", {"tool": name, **payload})
 
                 elif kind == "on_chat_model_stream":
-                    # Tool implementations (security/performance/write_file)
-                    # make their own nested LLM calls for structured output.
+                    # Tool implementations (security/performance/quality/
+                    # propose_edit/write_file) make their own nested LLM
+                    # calls for structured output.
                     # Only forward tokens from the top-level orchestrator's
                     # own conversational turn, not those nested calls.
                     if event.get("metadata", {}).get("langgraph_node") != "model":

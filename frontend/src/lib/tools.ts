@@ -1,5 +1,6 @@
 import {
   BrainCircuit,
+  FileDiff,
   FilePenLine,
   FileSearch,
   FolderOpen,
@@ -22,6 +23,7 @@ export const TOOL_META: Record<string, ToolMeta> = {
   security_analyzer: { label: "Security Analyzer", icon: ShieldCheck },
   performance_analyzer: { label: "Performance Analyzer", icon: Zap },
   code_quality_analyzer: { label: "Code Quality Analyzer", icon: Sparkles },
+  propose_edit: { label: "Drafting Proposed Change", icon: FileDiff },
   recall_memory: { label: "Recalling Memory", icon: BrainCircuit },
   save_memory: { label: "Saving Memory", icon: BrainCircuit },
   write_file: { label: "Editing File", icon: FilePenLine },

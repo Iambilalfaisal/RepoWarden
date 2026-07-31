@@ -43,8 +43,10 @@ export interface ChatMessage {
   kind?: "authorization" | "rejection"
   toolCalls?: ToolCallStatus[]
   analyses?: AnalysisResult[]
+  proposals?: FileEdit[]
   edits?: FileEdit[]
   streaming?: boolean
+  startedAt?: number
 }
 
 export interface ChatRequestBody {
