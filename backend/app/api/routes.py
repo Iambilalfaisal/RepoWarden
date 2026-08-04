@@ -1,13 +1,18 @@
 import json
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage
+from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import Command
 from sse_starlette.sse import EventSourceResponse
 
-from app.agents import AUTHORIZATION_NOTICE, build_editor_agent, build_reviewer_agent
-from app.api.schemas import ChatRequest, ChatTurn
+from app.agents import build_editor_agent, build_reviewer_agent
+from app.agents.reviewer.summary_chain import build_plan_summary_chain
+from app.agents.shared.editing import build_file_edit
+from app.api.schemas import ChatRequest, ChatTurn, ResumeRequest
 from app.core.fs_safety import FsSafetyError, build_tree, read_text_file, resolve_root
 
 router = APIRouter()
@@ -37,13 +42,126 @@ def _tool_output_to_dict(output: Any) -> dict[str, Any]:
     return {"text": str(content)}
 
 
-def _build_config(request: ChatRequest) -> dict[str, Any]:
-    configurable: dict[str, Any] = {"thread_id": request.thread_id}
-    if request.model:
-        configurable["model_name"] = request.model
-    if request.temperature is not None:
-        configurable["temperature"] = request.temperature
+def _render_transcript(analyses: list[dict[str, Any]], proposals: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for a in analyses:
+        lines.append(f"[{a.get('tool')}] {a.get('file_name')}: {a.get('summary')}")
+        for f in a.get("findings", []):
+            lines.append(f"  - ({f.get('severity')}) {f.get('title')}: {f.get('description')}")
+    for p in proposals:
+        lines.append(f"[proposed edit] {p.get('file_name')}: {p.get('explanation')}")
+    return "\n".join(lines)
+
+
+async def _summarize_plan(
+    analyses: list[dict[str, Any]], proposals: list[dict[str, Any]]
+) -> dict[str, Any]:
+    transcript = _render_transcript(analyses, proposals)
+    chain = build_plan_summary_chain()
+    plan_summary = await chain.ainvoke({"transcript": transcript})
+    return plan_summary.model_dump()
+
+
+def _pending_approvals(root: Path, hitl_request: dict[str, Any]) -> list[dict[str, Any]]:
+    """Turns a pending HumanInTheLoopMiddleware interrupt's action_requests
+    (each one a not-yet-executed write_file call) into the same FileEdit
+    shape the UI already renders for edit_proposed, so the approval queue
+    can show a real diff, not just a filename."""
+    pending = []
+    for action in hitl_request.get("action_requests", []):
+        args = action["args"]
+        edit = build_file_edit(root, args["path"], args["explanation"], args["proposed_code"])
+        pending.append(edit.model_dump())
+    return pending
+
+
+def _build_config(thread_id: str, root_dir: str, model: str | None, temperature: float | None) -> dict[str, Any]:
+    configurable: dict[str, Any] = {"thread_id": thread_id, "root_dir": root_dir}
+    if model:
+        configurable["model_name"] = model
+    if temperature is not None:
+        configurable["temperature"] = temperature
     return {"configurable": configurable}
+
+
+async def _stream_agent_events(
+    agent: CompiledStateGraph,
+    graph_input: Any,
+    config: dict[str, Any],
+    root_dir: str,
+    *,
+    is_editor: bool,
+) -> AsyncIterator[dict[str, str]]:
+    """Shared SSE loop for both a fresh turn (/chat) and a resume after
+    per-file approval (/chat/resume) — both drive the same graph the same
+    way and only differ in what they feed in as graph_input (a fresh
+    {"messages": [...]} vs a Command(resume=...))."""
+    final_text_parts: list[str] = []
+    file_written = False
+    analyses: list[dict[str, Any]] = []
+    proposals: list[dict[str, Any]] = []
+    try:
+        async for event in agent.astream_events(graph_input, version="v2", config=config):
+            kind = event.get("event")
+            name = event.get("name")
+            data = event.get("data", {})
+
+            if kind == "on_tool_start":
+                yield _sse("tool_start", {"tool": name, "input": data.get("input")})
+
+            elif kind == "on_tool_end":
+                payload = _tool_output_to_dict(data.get("output"))
+                if name in ANALYSIS_TOOLS:
+                    analyses.append({"tool": name, **payload})
+                    yield _sse("analysis_result", {"tool": name, **payload})
+                elif name == PROPOSE_TOOL:
+                    proposals.append(payload)
+                    yield _sse("edit_proposed", payload)
+                elif name == WRITE_TOOL:
+                    file_written = True
+                    yield _sse("file_written", payload)
+                else:
+                    yield _sse("tool_end", {"tool": name, **payload})
+
+            elif kind == "on_chat_model_stream":
+                # Tool implementations (security/performance/quality/
+                # propose_edit/write_file) make their own nested LLM calls
+                # for structured output. Only forward tokens from the
+                # top-level orchestrator's own conversational turn, not
+                # those nested calls.
+                if event.get("metadata", {}).get("langgraph_node") != "model":
+                    continue
+                chunk = data.get("chunk")
+                text = getattr(chunk, "content", "") if chunk else ""
+                if text:
+                    final_text_parts.append(text)
+                    yield _sse("token", {"text": text})
+
+        # HumanInTheLoopMiddleware pauses the graph with a real interrupt()
+        # before write_file executes (see app/agents/editor/agent.py) —
+        # astream_events finishes normally rather than raising when that
+        # happens, so a pending interrupt has to be checked for explicitly
+        # after the loop, not caught as an error.
+        state = await agent.aget_state(config)
+        if state.interrupts:
+            hitl_request = state.interrupts[0].value
+            pending = _pending_approvals(resolve_root(root_dir), hitl_request)
+            yield _sse("approval_required", {"pending": pending})
+            return
+
+        summary = "".join(final_text_parts)
+        if file_written or is_editor:
+            # Authorized turns are terminal whether or not a file ended up
+            # being written (e.g. no changes were warranted).
+            yield _sse("done", {"text": summary})
+        else:
+            if proposals:
+                plan_summary = await _summarize_plan(analyses, proposals)
+                yield _sse("plan_summary", plan_summary)
+            yield _sse("awaiting_authorization", {"text": summary})
+
+    except Exception as exc:  # noqa: BLE001 — surface any failure to the SSE client
+        yield _sse("error", {"message": str(exc)})
 
 
 @router.post("/chat")
@@ -52,74 +170,66 @@ async def chat(request: ChatRequest) -> EventSourceResponse:
     # model has to keep honoring: the Reviewer has no write_file tool at
     # all, so it is structurally incapable of modifying anything. The
     # Editor is only ever constructed here, after the user has authorized.
-    build_agent = build_editor_agent if request.authorized else build_reviewer_agent
+    # Both agents are compiled once (see build_reviewer_agent/build_editor_
+    # agent) — every tool resolves root_dir from this request's config, so
+    # rebuilding per-request is no longer necessary.
     try:
-        agent = build_agent(root_dir=request.root_dir)
+        resolve_root(request.root_dir)
     except FsSafetyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    agent = build_editor_agent() if request.authorized else build_reviewer_agent()
 
-    config = _build_config(request)
+    config = _build_config(request.thread_id, request.root_dir, request.model, request.temperature)
 
     # Short-term memory: the checkpointer (keyed by thread_id, in config)
     # loads and persists the full message history itself — we only ever
     # append this turn's new message(s), never resend prior history.
-    messages: list[Any] = []
-    if request.authorized:
-        messages.append(SystemMessage(content=AUTHORIZATION_NOTICE))
-    messages.append({"role": "user", "content": request.message})
+    graph_input = {"messages": [HumanMessage(content=request.message)]}
 
-    async def event_stream() -> AsyncIterator[dict[str, str]]:
-        final_text_parts: list[str] = []
-        file_written = False
-        try:
-            async for event in agent.astream_events(
-                {"messages": messages}, version="v2", config=config
-            ):
-                kind = event.get("event")
-                name = event.get("name")
-                data = event.get("data", {})
+    return EventSourceResponse(
+        _stream_agent_events(agent, graph_input, config, request.root_dir, is_editor=request.authorized)
+    )
 
-                if kind == "on_tool_start":
-                    yield _sse("tool_start", {"tool": name, "input": data.get("input")})
 
-                elif kind == "on_tool_end":
-                    payload = _tool_output_to_dict(data.get("output"))
-                    if name in ANALYSIS_TOOLS:
-                        yield _sse("analysis_result", {"tool": name, **payload})
-                    elif name == PROPOSE_TOOL:
-                        yield _sse("edit_proposed", payload)
-                    elif name == WRITE_TOOL:
-                        file_written = True
-                        yield _sse("file_written", payload)
-                    else:
-                        yield _sse("tool_end", {"tool": name, **payload})
+@router.post("/chat/resume")
+async def resume_chat(request: ResumeRequest) -> EventSourceResponse:
+    """Resumes an Editor run paused on a per-file write_file approval (see
+    HumanInTheLoopMiddleware in app/agents/editor/agent.py). Decisions must
+    be reordered to match the pending interrupt's action_requests order —
+    HumanInTheLoopMiddleware.after_model maps resume decisions to hanging
+    tool calls positionally, not by name."""
+    try:
+        resolve_root(request.root_dir)
+    except FsSafetyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-                elif kind == "on_chat_model_stream":
-                    # Tool implementations (security/performance/quality/
-                    # propose_edit/write_file) make their own nested LLM
-                    # calls for structured output.
-                    # Only forward tokens from the top-level orchestrator's
-                    # own conversational turn, not those nested calls.
-                    if event.get("metadata", {}).get("langgraph_node") != "model":
-                        continue
-                    chunk = data.get("chunk")
-                    text = getattr(chunk, "content", "") if chunk else ""
-                    if text:
-                        final_text_parts.append(text)
-                        yield _sse("token", {"text": text})
+    agent = build_editor_agent()
+    config = _build_config(request.thread_id, request.root_dir, None, None)
 
-            summary = "".join(final_text_parts)
-            if file_written or request.authorized:
-                # Authorized turns are terminal whether or not a file ended
-                # up being written (e.g. no changes were warranted).
-                yield _sse("done", {"text": summary})
-            else:
-                yield _sse("awaiting_authorization", {"text": summary})
+    state = await agent.aget_state(config)
+    if not state.interrupts:
+        raise HTTPException(status_code=409, detail="No pending approval for this thread.")
 
-        except Exception as exc:  # noqa: BLE001 — surface any failure to the SSE client
-            yield _sse("error", {"message": str(exc)})
+    hitl_request = state.interrupts[0].value
+    by_file = {d.file_name: d for d in request.decisions}
+    ordered_decisions: list[dict[str, Any]] = []
+    for action in hitl_request.get("action_requests", []):
+        path = action["args"]["path"]
+        decision = by_file.get(path)
+        if decision is None:
+            raise HTTPException(status_code=400, detail=f"Missing decision for '{path}'.")
+        if decision.type == "approve":
+            ordered_decisions.append({"type": "approve"})
+        else:
+            payload: dict[str, Any] = {"type": "reject"}
+            if decision.message:
+                payload["message"] = decision.message
+            ordered_decisions.append(payload)
 
-    return EventSourceResponse(event_stream())
+    graph_input = Command(resume={"decisions": ordered_decisions})
+    return EventSourceResponse(
+        _stream_agent_events(agent, graph_input, config, request.root_dir, is_editor=True)
+    )
 
 
 @router.get("/chat/history")
@@ -130,13 +240,16 @@ async def chat_history(root_dir: str = Query(...), thread_id: str = Query(...)) 
     that richer structure the frontend builds live from SSE events can't be
     reconstructed here."""
     try:
-        # Either agent can read the shared checkpointed state — which one
-        # we construct here doesn't affect what's returned.
-        agent = build_reviewer_agent(root_dir=root_dir)
+        resolve_root(root_dir)
     except FsSafetyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    state = await agent.aget_state({"configurable": {"thread_id": thread_id}})
+    # Either agent can read the shared checkpointed state — which one we
+    # reference here doesn't affect what's returned.
+    agent = build_reviewer_agent()
+    state = await agent.aget_state(
+        {"configurable": {"thread_id": thread_id, "root_dir": root_dir}}
+    )
     messages = state.values.get("messages", []) if state.values else []
     return [
         ChatTurn(role="user" if isinstance(m, HumanMessage) else "assistant", content=m.content)

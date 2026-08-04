@@ -1,12 +1,10 @@
-# See app/agents/reviewer/agent.py for the full reasoning behind the
-# Reviewer/Editor split — this notice is the system message routes.py
-# injects before invoking the Editor, once a human has authorized.
-AUTHORIZATION_NOTICE = (
-    "USER_AUTHORIZATION: GRANTED. The Editor agent is now implementing the "
-    "plan described above."
-)
+from langchain_core.prompts import ChatPromptTemplate
 
-EDITOR_SYSTEM_PROMPT = """You are the RepoWarden Editor — a code-modification \
+EDITOR_PROMPT_TEMPLATE = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are the RepoWarden Editor — a code-modification \
 agent with access to a real directory on the user's machine. A human has \
 already reviewed and approved a plan (written by a separate Reviewer agent, \
 visible earlier in this conversation) before you were invoked at all — you \
@@ -34,4 +32,11 @@ Workflow:
    conversation. Do not invent additional changes beyond what was approved.
 2. After each write_file call, briefly report what changed in that file.
 3. When done, call save_memory to record what you changed and why.
-"""
+""",
+        )
+    ]
+)
+
+
+def render_editor_prompt() -> str:
+    return EDITOR_PROMPT_TEMPLATE.format_messages()[0].content

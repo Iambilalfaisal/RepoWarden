@@ -15,3 +15,15 @@ class ChatRequest(BaseModel):
     authorized: bool = False
     model: str | None = None
     temperature: float | None = None
+
+
+class FileDecision(BaseModel):
+    file_name: str
+    type: Literal["approve", "reject"]
+    message: str | None = None
+
+
+class ResumeRequest(BaseModel):
+    thread_id: str
+    root_dir: str
+    decisions: list[FileDecision]

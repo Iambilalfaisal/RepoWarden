@@ -1,6 +1,4 @@
-from pathlib import Path
-
-from langchain_core.tools import StructuredTool, tool
+from langchain.tools import ToolRuntime, tool
 from pydantic import BaseModel, Field
 
 from app.core.fs_safety import (
@@ -9,8 +7,13 @@ from app.core.fs_safety import (
     MAX_READ_CHARS_FOR_LLM,
     list_dir_shallow,
     read_text_file,
+    resolve_root,
     search_files,
 )
+
+
+def _root(runtime: ToolRuntime):
+    return resolve_root(runtime.config["configurable"]["root_dir"])
 
 
 class ListDirectoryInput(BaseModel):
@@ -20,48 +23,42 @@ class ListDirectoryInput(BaseModel):
     )
 
 
-def make_list_directory_tool(root: Path) -> StructuredTool:
-    @tool(
-        "list_directory",
-        args_schema=ListDirectoryInput,
-        description=(
-            "Lists the immediate contents (files and subdirectories) of a "
-            "directory within the workspace, one level deep. Call again with "
-            "a subdirectory path to go deeper. Read-only and always safe."
-        ),
-    )
-    async def _run(path: str = ".") -> dict:
-        try:
-            entries = list_dir_shallow(root, path)
-        except FsSafetyError as exc:
-            return {"error": str(exc)}
-        return {"path": path, "entries": entries}
-
-    return _run
+@tool(
+    "list_directory",
+    args_schema=ListDirectoryInput,
+    description=(
+        "Lists the immediate contents (files and subdirectories) of a "
+        "directory within the workspace, one level deep. Call again with "
+        "a subdirectory path to go deeper. Read-only and always safe."
+    ),
+)
+async def list_directory(path: str = ".", *, runtime: ToolRuntime) -> dict:
+    try:
+        entries = list_dir_shallow(_root(runtime), path)
+    except FsSafetyError as exc:
+        return {"error": str(exc)}
+    return {"path": path, "entries": entries}
 
 
 class ReadFileInput(BaseModel):
     path: str = Field(description=PATH_FIELD_DESCRIPTION)
 
 
-def make_read_file_tool(root: Path) -> StructuredTool:
-    @tool(
-        "read_file",
-        args_schema=ReadFileInput,
-        description=(
-            "Reads the text content of a single file within the workspace. "
-            "Read-only and always safe. Always read a file before analyzing "
-            "or proposing changes to it."
-        ),
-    )
-    async def _run(path: str) -> dict:
-        try:
-            content = read_text_file(root, path, max_chars=MAX_READ_CHARS_FOR_LLM)
-        except FsSafetyError as exc:
-            return {"error": str(exc)}
-        return {"path": path, "content": content}
-
-    return _run
+@tool(
+    "read_file",
+    args_schema=ReadFileInput,
+    description=(
+        "Reads the text content of a single file within the workspace. "
+        "Read-only and always safe. Always read a file before analyzing "
+        "or proposing changes to it."
+    ),
+)
+async def read_file(path: str, *, runtime: ToolRuntime) -> dict:
+    try:
+        content = read_text_file(_root(runtime), path, max_chars=MAX_READ_CHARS_FOR_LLM)
+    except FsSafetyError as exc:
+        return {"error": str(exc)}
+    return {"path": path, "content": content}
 
 
 class SearchCodeInput(BaseModel):
@@ -69,25 +66,22 @@ class SearchCodeInput(BaseModel):
     is_regex: bool = Field(default=False, description="Treat pattern as a regular expression.")
 
 
-def make_search_code_tool(root: Path) -> StructuredTool:
-    @tool(
-        "search_code",
-        args_schema=SearchCodeInput,
-        description=(
-            "Searches file contents across the whole workspace for a piece of "
-            "text (or a regex, with is_regex=true) and returns matching "
-            "file/line locations. Use this before proposing a change to a "
-            "shared function, class, or exported symbol, to check its "
-            "'blast radius' — every other place that references it — so a "
-            "fix doesn't silently break a caller elsewhere. Read-only and "
-            "always safe."
-        ),
-    )
-    async def _run(pattern: str, is_regex: bool = False) -> dict:
-        try:
-            matches = search_files(root, pattern, is_regex=is_regex)
-        except FsSafetyError as exc:
-            return {"error": str(exc)}
-        return {"pattern": pattern, "matches": matches}
-
-    return _run
+@tool(
+    "search_code",
+    args_schema=SearchCodeInput,
+    description=(
+        "Searches file contents across the whole workspace for a piece of "
+        "text (or a regex, with is_regex=true) and returns matching "
+        "file/line locations. Use this before proposing a change to a "
+        "shared function, class, or exported symbol, to check its "
+        "'blast radius' — every other place that references it — so a "
+        "fix doesn't silently break a caller elsewhere. Read-only and "
+        "always safe."
+    ),
+)
+async def search_code(pattern: str, is_regex: bool = False, *, runtime: ToolRuntime) -> dict:
+    try:
+        matches = search_files(_root(runtime), pattern, is_regex=is_regex)
+    except FsSafetyError as exc:
+        return {"error": str(exc)}
+    return {"pattern": pattern, "matches": matches}

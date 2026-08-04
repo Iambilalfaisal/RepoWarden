@@ -1,21 +1,20 @@
+from functools import lru_cache
+
 from langchain.agents import create_agent
+from langchain.agents.middleware import SummarizationMiddleware
 from langgraph.graph.state import CompiledStateGraph
 
+from app.agents.guardrails import make_secret_guardrail
 from app.agents.llm import build_llm
 from app.agents.reviewer.analyzers import (
     code_quality_analyzer,
     performance_analyzer,
     security_analyzer,
 )
-from app.agents.reviewer.prompt import REVIEWER_SYSTEM_PROMPT
-from app.agents.reviewer.tools import make_propose_edit_tool
-from app.agents.shared.filesystem import (
-    make_list_directory_tool,
-    make_read_file_tool,
-    make_search_code_tool,
-)
-from app.agents.shared.memory import make_recall_memory_tool, make_save_memory_tool
-from app.core.fs_safety import resolve_root
+from app.agents.reviewer.prompt import render_reviewer_prompt
+from app.agents.reviewer.tools import propose_edit
+from app.agents.shared.filesystem import list_directory, read_file, search_code
+from app.agents.shared.memory import recall_memory, save_memory
 from app.core.memory_store import get_store
 from app.core.mongo import get_checkpointer
 
@@ -29,29 +28,50 @@ from app.core.mongo import get_checkpointer
 # to keep honoring. Both share the same checkpointer + thread_id, so the
 # Editor sees the Reviewer's plan in the persisted conversation with no
 # extra hand-off plumbing.
+#
+# Every tool bound below resolves its per-request root_dir from
+# RunnableConfig (via ToolRuntime, injected by the ToolNode at call time —
+# see app/agents/shared/filesystem.py) rather than closing over a directory,
+# so this graph is identical for every request/directory and only needs to
+# be compiled once.
 
 
-def build_reviewer_agent(root_dir: str) -> CompiledStateGraph:
-    root = resolve_root(root_dir)
+@lru_cache(maxsize=1)
+def build_reviewer_agent() -> CompiledStateGraph:
     llm = build_llm()
     store = get_store()
 
     tools = [
-        make_list_directory_tool(root),
-        make_read_file_tool(root),
-        make_search_code_tool(root),
+        list_directory,
+        read_file,
+        search_code,
         security_analyzer,
         performance_analyzer,
         code_quality_analyzer,
-        make_propose_edit_tool(root),
-        make_recall_memory_tool(store, root_dir),
-        make_save_memory_tool(store, root_dir),
+        propose_edit,
+        recall_memory,
+        save_memory,
+    ]
+
+    # SummarizationMiddleware condenses everything older than the last 20
+    # messages into one summary once the thread crosses ~6000 tokens, so a
+    # long-running review doesn't grow the checkpointer's message list (and
+    # therefore cost/latency) forever — reuses this same model, no separate
+    # summarizer to configure. make_secret_guardrail() is the LLM-content
+    # guardrail: it redacts secret-shaped tokens from tool results and the
+    # model's own output, layered on top of (not instead of) fs_safety's
+    # filesystem sandboxing, which stops secret *files* from being opened at
+    # all but says nothing about a token that appears inside an allowed file.
+    middleware = [
+        SummarizationMiddleware(model=llm, trigger=("tokens", 6000), keep=("messages", 20)),
+        make_secret_guardrail(),
     ]
 
     return create_agent(
         model=llm,
         tools=tools,
-        system_prompt=REVIEWER_SYSTEM_PROMPT,
+        system_prompt=render_reviewer_prompt(),
+        middleware=middleware,
         checkpointer=get_checkpointer(),
         store=store,
     )

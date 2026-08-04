@@ -14,11 +14,13 @@ function App() {
     isHydrating,
     isStreaming,
     awaitingAuthorization,
+    pendingApprovals,
     writtenFiles,
     proposedEdits,
     sendMessage,
     authorize,
     reject,
+    decideFile,
   } = useAgentChat({
     rootDir: workspace.rootDir,
     onFileWritten: (edit) => {
@@ -50,9 +52,11 @@ function App() {
         isHydrating={isHydrating}
         isStreaming={isStreaming}
         awaitingAuthorization={awaitingAuthorization}
+        pendingApprovals={pendingApprovals}
         onSend={sendMessage}
         onAllow={authorize}
         onReject={reject}
+        onDecideFile={decideFile}
         onJumpToLine={handleJumpToLine}
         onViewFile={workspace.setActiveFile}
       />

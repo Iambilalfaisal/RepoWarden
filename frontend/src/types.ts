@@ -31,6 +31,12 @@ export interface FileEdit {
   proposed_code: string
 }
 
+export interface PlanSummary {
+  overall_risk: Severity
+  files_affected: string[]
+  headline: string
+}
+
 export interface ToolCallStatus {
   tool: string
   status: "running" | "done"
@@ -45,6 +51,7 @@ export interface ChatMessage {
   analyses?: AnalysisResult[]
   proposals?: FileEdit[]
   edits?: FileEdit[]
+  planSummary?: PlanSummary
   streaming?: boolean
   startedAt?: number
 }
@@ -56,6 +63,18 @@ export interface ChatRequestBody {
   authorized: boolean
   model?: string
   temperature?: number
+}
+
+export interface FileDecision {
+  file_name: string
+  type: "approve" | "reject"
+  message?: string
+}
+
+export interface ResumeRequestBody {
+  thread_id: string
+  root_dir: string
+  decisions: FileDecision[]
 }
 
 export interface TreeNode {

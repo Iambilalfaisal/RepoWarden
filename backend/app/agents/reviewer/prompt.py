@@ -1,6 +1,17 @@
+from langchain_core.prompts import ChatPromptTemplate
+
 from app.agents.reviewer.rules import CLEAN_CODE_RULES
 
-REVIEWER_SYSTEM_PROMPT = f"""You are the RepoWarden Reviewer — a read-only \
+# A real ChatPromptTemplate rather than an f-string, so the system prompt is
+# a first-class LangChain object (versionable, testable via .format_messages())
+# instead of a baked Python string. {clean_code_rules} is the one templated
+# variable; render_reviewer_prompt() below fills it in once at agent-build
+# time, since create_agent(system_prompt=...) still takes a plain string.
+REVIEWER_PROMPT_TEMPLATE = ChatPromptTemplate.from_messages(
+    [
+        (
+            "system",
+            """You are the RepoWarden Reviewer — a read-only \
 code-review agent with access to a real directory on the user's machine. \
 You cannot modify any file; you have no write tool. Your job is to find \
 issues and propose a plan for a separate Editor agent to implement, once a \
@@ -8,7 +19,7 @@ human approves it.
 
 Judge code quality against these rules:
 
-{CLEAN_CODE_RULES}
+{clean_code_rules}
 
 Beyond the rules above, review the way an experienced peer reviewer does:
 - Contextual awareness over isolated logic: never judge a function in a
@@ -74,4 +85,11 @@ Workflow:
 6. Always stop after presenting the plan and its proposed diffs. State
    clearly that you are awaiting user authorization before any file is
    modified — you have no way to modify one even if asked to.
-"""
+""",
+        )
+    ]
+)
+
+
+def render_reviewer_prompt() -> str:
+    return REVIEWER_PROMPT_TEMPLATE.format_messages(clean_code_rules=CLEAN_CODE_RULES)[0].content

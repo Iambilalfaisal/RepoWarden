@@ -2,7 +2,8 @@ import { useEffect, useRef } from "react"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Button } from "@/components/ui/button"
 import { ShieldCheck, Sparkles, Zap } from "lucide-react"
-import type { ChatMessage } from "@/types"
+import type { ChatMessage, FileEdit } from "@/types"
+import { FileApprovalQueue } from "./FileApprovalQueue"
 import { MessageBubble } from "./MessageBubble"
 import { MessageInput } from "./MessageInput"
 import { PermissionBar } from "./PermissionBar"
@@ -12,9 +13,11 @@ interface ChatPaneProps {
   isHydrating: boolean
   isStreaming: boolean
   awaitingAuthorization: boolean
+  pendingApprovals: FileEdit[]
   onSend: (text: string) => void
   onAllow: () => void
   onReject: () => void
+  onDecideFile: (fileName: string, type: "approve" | "reject") => void
   onJumpToLine?: (fileName: string, line: number) => void
   onViewFile?: (fileName: string) => void
 }
@@ -30,9 +33,11 @@ export function ChatPane({
   isHydrating,
   isStreaming,
   awaitingAuthorization,
+  pendingApprovals,
   onSend,
   onAllow,
   onReject,
+  onDecideFile,
   onJumpToLine,
   onViewFile,
 }: ChatPaneProps) {
@@ -88,13 +93,22 @@ export function ChatPane({
         </div>
       </ScrollArea>
 
+      {pendingApprovals.length > 0 && (
+        <FileApprovalQueue pending={pendingApprovals} onDecide={onDecideFile} disabled={isStreaming} />
+      )}
+
       {awaitingAuthorization && (
-        <PermissionBar onAllow={onAllow} onReject={onReject} disabled={isStreaming} />
+        <PermissionBar
+          onAllow={onAllow}
+          onReject={onReject}
+          disabled={isStreaming}
+          planSummary={[...messages].reverse().find((m) => m.planSummary)?.planSummary}
+        />
       )}
 
       <MessageInput
         onSend={onSend}
-        disabled={isStreaming || awaitingAuthorization || isHydrating}
+        disabled={isStreaming || awaitingAuthorization || pendingApprovals.length > 0 || isHydrating}
       />
     </div>
   )

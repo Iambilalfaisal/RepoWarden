@@ -1,7 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import { fetchEventSource } from "@microsoft/fetch-event-source"
 import { API_BASE, fetchChatHistory, getOrCreateThreadId } from "@/lib/api"
-import type { AnalysisResult, ChatMessage, ChatRequestBody, FileEdit, ToolCallStatus } from "@/types"
+import type {
+  AnalysisResult,
+  ChatMessage,
+  ChatRequestBody,
+  FileDecision,
+  FileEdit,
+  PlanSummary,
+  ResumeRequestBody,
+  ToolCallStatus,
+} from "@/types"
 
 function newId() {
   return crypto.randomUUID()
@@ -18,11 +27,24 @@ export function useAgentChat({ rootDir, onFileWritten }: UseAgentChatOptions) {
   const [isHydrating, setIsHydrating] = useState(false)
   const [isStreaming, setIsStreaming] = useState(false)
   const [awaitingAuthorization, setAwaitingAuthorization] = useState(false)
+  // Per-file approvals pending inside an already-authorized Editor run (a
+  // real LangGraph interrupt() per write_file call — see
+  // HumanInTheLoopMiddleware in app/agents/editor/agent.py) — distinct from
+  // awaitingAuthorization above, which gates whether the Editor gets
+  // invoked at all.
+  const [pendingApprovals, setPendingApprovals] = useState<FileEdit[]>([])
   const [writtenFiles, setWrittenFiles] = useState<Record<string, FileEdit>>({})
   const [proposedEdits, setProposedEdits] = useState<Record<string, FileEdit>>({})
   const abortRef = useRef<AbortController | null>(null)
   const onFileWrittenRef = useRef(onFileWritten)
   onFileWrittenRef.current = onFileWritten
+  const messagesRef = useRef<ChatMessage[]>([])
+  const lastAssistantIdRef = useRef<string | null>(null)
+  const decisionsRef = useRef<Record<string, FileDecision>>({})
+
+  useEffect(() => {
+    messagesRef.current = messages
+  }, [messages])
 
   // Short-term memory now lives server-side, keyed by thread_id (one per
   // rootDir, persisted in localStorage) — on opening a directory we hydrate
@@ -33,6 +55,8 @@ export function useAgentChat({ rootDir, onFileWritten }: UseAgentChatOptions) {
     setWrittenFiles({})
     setProposedEdits({})
     setAwaitingAuthorization(false)
+    setPendingApprovals([])
+    decisionsRef.current = {}
     if (!rootDir) {
       setThreadId(null)
       return
@@ -58,26 +82,23 @@ export function useAgentChat({ rootDir, onFileWritten }: UseAgentChatOptions) {
     [],
   )
 
-  const runTurn = useCallback(
-    async (userMessage: string, authorized: boolean) => {
-      if (!rootDir || !threadId) return
+  // Shared SSE consumer for both a fresh turn (POST /api/chat) and a
+  // resume after per-file approval (POST /api/chat/resume) — both speak
+  // the same event vocabulary and both append to the same assistant
+  // bubble, since a resume is a continuation of the same paused turn, not
+  // a new one.
+  const streamEvents = useCallback(
+    async (url: string, body: unknown, assistantId: string) => {
       abortRef.current?.abort()
       const controller = new AbortController()
       abortRef.current = controller
-
-      const assistantId = newId()
-
-      setMessages((prev) => [
-        ...prev,
-        { id: assistantId, role: "assistant", content: "", streaming: true, startedAt: Date.now() },
-      ])
       setIsStreaming(true)
-      setAwaitingAuthorization(false)
 
-      const toolCalls: ToolCallStatus[] = []
-      const analyses: AnalysisResult[] = []
-      const proposals: FileEdit[] = []
-      const edits: FileEdit[] = []
+      const existing = messagesRef.current.find((m) => m.id === assistantId)
+      const toolCalls: ToolCallStatus[] = [...(existing?.toolCalls ?? [])]
+      const analyses: AnalysisResult[] = [...(existing?.analyses ?? [])]
+      const proposals: FileEdit[] = [...(existing?.proposals ?? [])]
+      const edits: FileEdit[] = [...(existing?.edits ?? [])]
 
       const markToolDone = (tool: string) => {
         const idx = toolCalls.findIndex((t) => t.tool === tool && t.status === "running")
@@ -85,22 +106,17 @@ export function useAgentChat({ rootDir, onFileWritten }: UseAgentChatOptions) {
       }
 
       try {
-        await fetchEventSource(`${API_BASE}/api/chat`, {
+        await fetchEventSource(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            message: userMessage,
-            thread_id: threadId,
-            root_dir: rootDir,
-            authorized,
-          } satisfies ChatRequestBody),
+          body: JSON.stringify(body),
           signal: controller.signal,
           openWhenHidden: true,
 
           async onopen(res) {
             if (!res.ok) {
-              const body = await res.json().catch(() => null)
-              throw new Error(body?.detail ?? `Chat request failed: ${res.status}`)
+              const resBody = await res.json().catch(() => null)
+              throw new Error(resBody?.detail ?? `Chat request failed: ${res.status}`)
             }
           },
 
@@ -171,6 +187,24 @@ export function useAgentChat({ rootDir, onFileWritten }: UseAgentChatOptions) {
                 }))
                 break
               }
+              case "plan_summary": {
+                const planSummary = payload as PlanSummary
+                updateMessage(assistantId, (m) => ({ ...m, planSummary }))
+                break
+              }
+              case "approval_required": {
+                const pending: FileEdit[] = (payload.pending ?? []).map(
+                  (p: FileEdit) => ({
+                    file_name: p.file_name,
+                    explanation: p.explanation,
+                    original_code: p.original_code,
+                    proposed_code: p.proposed_code,
+                  }),
+                )
+                decisionsRef.current = {}
+                setPendingApprovals(pending)
+                break
+              }
               case "awaiting_authorization": {
                 setAwaitingAuthorization(true)
                 break
@@ -208,7 +242,34 @@ export function useAgentChat({ rootDir, onFileWritten }: UseAgentChatOptions) {
         setIsStreaming(false)
       }
     },
-    [rootDir, threadId, updateMessage],
+    [updateMessage],
+  )
+
+  const runTurn = useCallback(
+    async (userMessage: string, authorized: boolean) => {
+      if (!rootDir || !threadId) return
+
+      const assistantId = newId()
+      lastAssistantIdRef.current = assistantId
+      setMessages((prev) => [
+        ...prev,
+        { id: assistantId, role: "assistant", content: "", streaming: true, startedAt: Date.now() },
+      ])
+      setAwaitingAuthorization(false)
+      setPendingApprovals([])
+
+      await streamEvents(
+        `${API_BASE}/api/chat`,
+        {
+          message: userMessage,
+          thread_id: threadId,
+          root_dir: rootDir,
+          authorized,
+        } satisfies ChatRequestBody,
+        assistantId,
+      )
+    },
+    [rootDir, threadId, streamEvents],
   )
 
   const sendMessage = useCallback(
@@ -246,15 +307,43 @@ export function useAgentChat({ rootDir, onFileWritten }: UseAgentChatOptions) {
     setMessages((prev) => [...prev, note])
   }, [])
 
+  // Per-file decision inside an already-authorized Editor run. Each
+  // write_file call pauses independently (HumanInTheLoopMiddleware), and
+  // a single interrupt can bundle more than one pending file if the model
+  // requested several writes in the same turn — all of them must be
+  // decided before the run can resume, so this only fires the actual
+  // /api/chat/resume call once every currently-pending file has a decision.
+  const decideFile = useCallback(
+    (fileName: string, type: "approve" | "reject", message?: string) => {
+      decisionsRef.current[fileName] = { file_name: fileName, type, message }
+      const allDecided = pendingApprovals.every((p) => decisionsRef.current[p.file_name])
+      if (!allDecided || !rootDir || !threadId || !lastAssistantIdRef.current) return
+
+      const decisions = pendingApprovals.map((p) => decisionsRef.current[p.file_name])
+      const assistantId = lastAssistantIdRef.current
+      decisionsRef.current = {}
+      setPendingApprovals([])
+
+      void streamEvents(
+        `${API_BASE}/api/chat/resume`,
+        { thread_id: threadId, root_dir: rootDir, decisions } satisfies ResumeRequestBody,
+        assistantId,
+      )
+    },
+    [pendingApprovals, rootDir, threadId, streamEvents],
+  )
+
   return {
     messages,
     isHydrating,
     isStreaming,
     awaitingAuthorization,
+    pendingApprovals,
     writtenFiles,
     proposedEdits,
     sendMessage,
     authorize,
     reject,
+    decideFile,
   }
 }

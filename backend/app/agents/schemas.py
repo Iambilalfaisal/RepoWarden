@@ -24,3 +24,9 @@ class FileEdit(BaseModel):
     explanation: str
     original_code: str
     proposed_code: str
+
+
+class PlanSummary(BaseModel):
+    overall_risk: Severity
+    files_affected: list[str]
+    headline: str
