@@ -2,9 +2,17 @@ from functools import lru_cache
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
+from pydantic import BaseModel
 
 from app.agents.llm import build_llm
-from app.agents.schemas import PlanSummary
+from app.agents.reviewer.analyzers import Severity
+
+
+class PlanSummary(BaseModel):
+    overall_risk: Severity
+    files_affected: list[str]
+    headline: str
+
 
 # A real LCEL chain (prompt | structured-output model), separate from the
 # main tool-calling agent loop: the Reviewer's own turn already produces
@@ -33,4 +41,13 @@ SUMMARY_PROMPT = ChatPromptTemplate.from_messages(
 
 @lru_cache(maxsize=1)
 def build_plan_summary_chain() -> Runnable:
-    return SUMMARY_PROMPT | build_llm().with_structured_output(PlanSummary)
+    # method="function_calling" is the same fix already proven necessary for
+    # this project's models (see backend layout notes): the default native
+    # structured-output mode has been observed returning prose instead of
+    # JSON. .with_retry() covers the cases that still slip through — a
+    # transient bad parse retries automatically (3 attempts, exponential
+    # backoff) instead of raising straight out of this nested LLM call and
+    # killing the whole SSE turn (see _summarize_plan in api/routes.py,
+    # which also degrades gracefully if every attempt fails).
+    structured_llm = build_llm().with_structured_output(PlanSummary, method="function_calling")
+    return (SUMMARY_PROMPT | structured_llm).with_retry(stop_after_attempt=3)

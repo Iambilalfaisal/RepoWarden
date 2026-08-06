@@ -1,21 +1,57 @@
+import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import HumanMessage
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Command
+from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from app.agents import build_editor_agent, build_reviewer_agent
 from app.agents.reviewer.summary_chain import build_plan_summary_chain
 from app.agents.shared.editing import build_file_edit
-from app.api.schemas import ChatRequest, ChatTurn, ResumeRequest
+from app.core.chat_history import append_turn, get_turns
 from app.core.fs_safety import FsSafetyError, build_tree, read_text_file, resolve_root
 
 router = APIRouter()
+
+
+# Request/response contracts — kept here rather than in a separate
+# api/schemas.py, since this router is the only place that ever
+# constructs or consumes them.
+class ChatTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class ChatRequest(BaseModel):
+    message: str
+    thread_id: str
+    root_dir: str
+    authorized: bool = False
+    model: str | None = None
+    temperature: float | None = None
+
+
+class FileDecision(BaseModel):
+    file_name: str
+    type: Literal["approve", "reject"]
+    message: str | None = None
+
+
+class ResumeRequest(BaseModel):
+    thread_id: str
+    root_dir: str
+    decisions: list[FileDecision]
+
+
+logger = logging.getLogger(__name__)
 
 # Tools whose output should be surfaced to the UI as structured analysis
 # results rather than a generic tool badge.
@@ -55,10 +91,20 @@ def _render_transcript(analyses: list[dict[str, Any]], proposals: list[dict[str,
 
 async def _summarize_plan(
     analyses: list[dict[str, Any]], proposals: list[dict[str, Any]]
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
+    """Best-effort: build_plan_summary_chain() already retries transient bad
+    parses internally (see agents/reviewer/summary_chain.py). If every
+    attempt still fails, this is a one-sentence risk headline, not the
+    actual analysis/proposals — losing it isn't worth killing the whole SSE
+    turn (and the real findings/diffs the user needs) over, so log it and
+    let the caller skip the plan_summary event instead of erroring out."""
     transcript = _render_transcript(analyses, proposals)
     chain = build_plan_summary_chain()
-    plan_summary = await chain.ainvoke({"transcript": transcript})
+    try:
+        plan_summary = await chain.ainvoke({"transcript": transcript})
+    except Exception:
+        logger.exception("Plan summary generation failed after retries; skipping plan_summary event.")
+        return None
     return plan_summary.model_dump()
 
 
@@ -84,6 +130,105 @@ def _build_config(thread_id: str, root_dir: str, model: str | None, temperature:
     return {"configurable": configurable}
 
 
+@dataclass
+class _TurnAccumulator:
+    """Mutable state built up while dispatching one turn's astream_events,
+    then read back by _finalize_turn once the stream ends."""
+
+    final_text_parts: list[str] = field(default_factory=list)
+    file_written: bool = False
+    analyses: list[dict[str, Any]] = field(default_factory=list)
+    proposals: list[dict[str, Any]] = field(default_factory=list)
+
+
+async def _dispatch_event(event: dict[str, Any], acc: _TurnAccumulator) -> AsyncIterator[dict[str, str]]:
+    """Turns one astream_events event into zero or more SSE frames,
+    recording whatever _finalize_turn will need afterwards (streamed text,
+    whether a file was written, analyses/proposals) into acc along the way."""
+    kind = event.get("event")
+    name = event.get("name")
+    data = event.get("data", {})
+
+    if kind == "on_tool_start":
+        yield _sse("tool_start", {"tool": name, "input": data.get("input")})
+        return
+
+    if kind == "on_tool_end":
+        payload = _tool_output_to_dict(data.get("output"))
+        if name in ANALYSIS_TOOLS:
+            acc.analyses.append({"tool": name, **payload})
+            yield _sse("analysis_result", {"tool": name, **payload})
+        elif name == PROPOSE_TOOL:
+            acc.proposals.append(payload)
+            yield _sse("edit_proposed", payload)
+        elif name == WRITE_TOOL:
+            acc.file_written = True
+            yield _sse("file_written", payload)
+        else:
+            yield _sse("tool_end", {"tool": name, **payload})
+        return
+
+    if kind == "on_chat_model_stream":
+        # Tool implementations (security/performance/quality/propose_edit/
+        # write_file) make their own nested LLM calls for structured
+        # output. Only forward tokens from the top-level orchestrator's own
+        # conversational turn, not those nested calls.
+        if event.get("metadata", {}).get("langgraph_node") != "model":
+            return
+        chunk = data.get("chunk")
+        text = getattr(chunk, "content", "") if chunk else ""
+        if text:
+            acc.final_text_parts.append(text)
+            yield _sse("token", {"text": text})
+
+
+async def _finalize_turn(
+    agent: CompiledStateGraph,
+    config: dict[str, Any],
+    root_dir: str,
+    thread_id: str,
+    acc: _TurnAccumulator,
+    *,
+    is_editor: bool,
+) -> AsyncIterator[dict[str, str]]:
+    """Runs once astream_events finishes for a turn: persists the durable
+    transcript, then emits whichever terminal SSE event applies —
+    approval_required, done, or plan_summary (best-effort) + awaiting_
+    authorization."""
+    # HumanInTheLoopMiddleware pauses the graph with a real interrupt()
+    # before write_file executes (see app/agents/editor/agent.py) —
+    # astream_events finishes normally rather than raising when that
+    # happens, so a pending interrupt has to be checked for explicitly
+    # after the loop, not caught as an error.
+    state = await agent.aget_state(config)
+
+    # Durable transcript write — deliberately independent of the
+    # checkpointed graph state above, which SummarizationMiddleware can
+    # (and does) collapse/replace once a thread grows past its token
+    # trigger. See app/core/chat_history.py for why this can't be
+    # reconstructed from aget_state() later.
+    summary = "".join(acc.final_text_parts)
+    await asyncio.to_thread(append_turn, thread_id, root_dir, "assistant", summary)
+
+    if state.interrupts:
+        hitl_request = state.interrupts[0].value
+        pending = _pending_approvals(resolve_root(root_dir), hitl_request)
+        yield _sse("approval_required", {"pending": pending})
+        return
+
+    if acc.file_written or is_editor:
+        # Authorized turns are terminal whether or not a file ended up
+        # being written (e.g. no changes were warranted).
+        yield _sse("done", {"text": summary})
+        return
+
+    if acc.proposals:
+        plan_summary = await _summarize_plan(acc.analyses, acc.proposals)
+        if plan_summary is not None:
+            yield _sse("plan_summary", plan_summary)
+    yield _sse("awaiting_authorization", {"text": summary})
+
+
 async def _stream_agent_events(
     agent: CompiledStateGraph,
     graph_input: Any,
@@ -95,70 +240,18 @@ async def _stream_agent_events(
     """Shared SSE loop for both a fresh turn (/chat) and a resume after
     per-file approval (/chat/resume) — both drive the same graph the same
     way and only differ in what they feed in as graph_input (a fresh
-    {"messages": [...]} vs a Command(resume=...))."""
-    final_text_parts: list[str] = []
-    file_written = False
-    analyses: list[dict[str, Any]] = []
-    proposals: list[dict[str, Any]] = []
+    {"messages": [...]} vs a Command(resume=...)). Event-by-event dispatch
+    and post-loop finalization are split out into _dispatch_event/
+    _finalize_turn above so this stays a thin orchestrator."""
+    thread_id = config["configurable"]["thread_id"]
+    acc = _TurnAccumulator()
     try:
         async for event in agent.astream_events(graph_input, version="v2", config=config):
-            kind = event.get("event")
-            name = event.get("name")
-            data = event.get("data", {})
+            async for sse in _dispatch_event(event, acc):
+                yield sse
 
-            if kind == "on_tool_start":
-                yield _sse("tool_start", {"tool": name, "input": data.get("input")})
-
-            elif kind == "on_tool_end":
-                payload = _tool_output_to_dict(data.get("output"))
-                if name in ANALYSIS_TOOLS:
-                    analyses.append({"tool": name, **payload})
-                    yield _sse("analysis_result", {"tool": name, **payload})
-                elif name == PROPOSE_TOOL:
-                    proposals.append(payload)
-                    yield _sse("edit_proposed", payload)
-                elif name == WRITE_TOOL:
-                    file_written = True
-                    yield _sse("file_written", payload)
-                else:
-                    yield _sse("tool_end", {"tool": name, **payload})
-
-            elif kind == "on_chat_model_stream":
-                # Tool implementations (security/performance/quality/
-                # propose_edit/write_file) make their own nested LLM calls
-                # for structured output. Only forward tokens from the
-                # top-level orchestrator's own conversational turn, not
-                # those nested calls.
-                if event.get("metadata", {}).get("langgraph_node") != "model":
-                    continue
-                chunk = data.get("chunk")
-                text = getattr(chunk, "content", "") if chunk else ""
-                if text:
-                    final_text_parts.append(text)
-                    yield _sse("token", {"text": text})
-
-        # HumanInTheLoopMiddleware pauses the graph with a real interrupt()
-        # before write_file executes (see app/agents/editor/agent.py) —
-        # astream_events finishes normally rather than raising when that
-        # happens, so a pending interrupt has to be checked for explicitly
-        # after the loop, not caught as an error.
-        state = await agent.aget_state(config)
-        if state.interrupts:
-            hitl_request = state.interrupts[0].value
-            pending = _pending_approvals(resolve_root(root_dir), hitl_request)
-            yield _sse("approval_required", {"pending": pending})
-            return
-
-        summary = "".join(final_text_parts)
-        if file_written or is_editor:
-            # Authorized turns are terminal whether or not a file ended up
-            # being written (e.g. no changes were warranted).
-            yield _sse("done", {"text": summary})
-        else:
-            if proposals:
-                plan_summary = await _summarize_plan(analyses, proposals)
-                yield _sse("plan_summary", plan_summary)
-            yield _sse("awaiting_authorization", {"text": summary})
+        async for sse in _finalize_turn(agent, config, root_dir, thread_id, acc, is_editor=is_editor):
+            yield sse
 
     except Exception as exc:  # noqa: BLE001 — surface any failure to the SSE client
         yield _sse("error", {"message": str(exc)})
@@ -180,6 +273,10 @@ async def chat(request: ChatRequest) -> EventSourceResponse:
     agent = build_editor_agent() if request.authorized else build_reviewer_agent()
 
     config = _build_config(request.thread_id, request.root_dir, request.model, request.temperature)
+
+    # Durable transcript write (app/core/chat_history.py) — separate from
+    # the checkpointer below, which is mutable working state, not a log.
+    await asyncio.to_thread(append_turn, request.thread_id, request.root_dir, "user", request.message)
 
     # Short-term memory: the checkpointer (keyed by thread_id, in config)
     # loads and persists the full message history itself — we only ever
@@ -234,28 +331,18 @@ async def resume_chat(request: ResumeRequest) -> EventSourceResponse:
 
 @router.get("/chat/history")
 async def chat_history(root_dir: str = Query(...), thread_id: str = Query(...)) -> list[ChatTurn]:
-    """Hydrates the chat UI on load from the checkpointer's persisted state
-    for this thread. Only plain human/AI text is replayed — tool calls,
-    findings, and diffs aren't part of the persisted LangChain messages, so
-    that richer structure the frontend builds live from SSE events can't be
-    reconstructed here."""
+    """Hydrates the chat UI on load from this thread's durable transcript
+    (app/core/chat_history.py) — NOT the checkpointer's live graph state.
+    Only plain human/AI text is replayed — tool calls, findings, and diffs
+    aren't recorded here, so that richer structure the frontend builds live
+    from SSE events can't be reconstructed on reload."""
     try:
         resolve_root(root_dir)
     except FsSafetyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # Either agent can read the shared checkpointed state — which one we
-    # reference here doesn't affect what's returned.
-    agent = build_reviewer_agent()
-    state = await agent.aget_state(
-        {"configurable": {"thread_id": thread_id, "root_dir": root_dir}}
-    )
-    messages = state.values.get("messages", []) if state.values else []
-    return [
-        ChatTurn(role="user" if isinstance(m, HumanMessage) else "assistant", content=m.content)
-        for m in messages
-        if isinstance(m, (HumanMessage, AIMessage)) and isinstance(m.content, str) and m.content
-    ]
+    turns = await asyncio.to_thread(get_turns, thread_id)
+    return [ChatTurn(role=t["role"], content=t["content"]) for t in turns]
 
 
 @router.get("/workspace/tree")

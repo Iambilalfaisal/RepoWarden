@@ -2,13 +2,19 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from app.agents.schemas import FileEdit
 from app.core.fs_safety import (
     PATH_FIELD_DESCRIPTION,
     FsSafetyError,
     MAX_READ_CHARS_FOR_LLM,
     read_text_file,
 )
+
+
+class FileEdit(BaseModel):
+    file_name: str
+    explanation: str
+    original_code: str
+    proposed_code: str
 
 
 class FileEditInput(BaseModel):

@@ -1,6 +1,23 @@
-from langchain_core.tools import StructuredTool, tool
+from typing import Literal
 
-from app.agents.schemas import AnalysisReport, Finding
+from langchain_core.tools import StructuredTool, tool
+from pydantic import BaseModel
+
+Severity = Literal["low", "medium", "high", "critical"]
+
+
+class Finding(BaseModel):
+    severity: Severity
+    line: int | None = None
+    title: str
+    description: str
+    suggested_fix: str | None = None
+
+
+class AnalysisReport(BaseModel):
+    file_name: str = ""
+    summary: str
+    findings: list[Finding]
 
 
 def _make_report_tool(name: str, description: str) -> StructuredTool:
